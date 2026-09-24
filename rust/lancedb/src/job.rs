@@ -99,22 +99,24 @@ impl TerminalResult {
 
     fn decode<T: DeserializeOwned>(self) -> Result<T> {
         let value = self.value.ok_or_else(|| match &self.request_id {
+            #[cfg(feature = "remote")]
             Some(request_id) => Error::Http {
                 source: "successful typed job response did not contain a result".into(),
                 request_id: request_id.clone(),
                 status_code: None,
             },
-            None => Error::Runtime {
+            _ => Error::Runtime {
                 message: "successful typed job did not contain a result".to_string(),
             },
         })?;
         serde_json::from_value(value).map_err(|error| match self.request_id {
+            #[cfg(feature = "remote")]
             Some(request_id) => Error::Http {
                 source: format!("failed to parse typed job result: {error}").into(),
                 request_id,
                 status_code: None,
             },
-            None => Error::Runtime {
+            _ => Error::Runtime {
                 message: format!("failed to parse typed job result: {error}"),
             },
         })
