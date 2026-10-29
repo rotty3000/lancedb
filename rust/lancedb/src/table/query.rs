@@ -105,12 +105,16 @@ async fn can_execute_namespace_query(table: &NativeTable, query: &AnyQuery) -> R
     Ok(true)
 }
 
-fn requires_local_namespace_execution(query: &AnyQuery) -> bool {
+pub(crate) fn requires_local_namespace_execution(query: &AnyQuery) -> bool {
     // The namespace QueryTable request has no approx_mode or use_lsm field yet, so
     // pushing these down would silently ignore the user's setting. For use_lsm that
     // is worse than a tuning miss: MemWAL read routing lives only in `create_plan`,
     // so a pushed-down query would return stale base-only data with no error.
-    if query.base().use_lsm.is_some() || query.base().take_offsets.is_some() {
+    // A row-address prefilter is applied only by the local scanner in `create_plan`.
+    if query.base().use_lsm.is_some()
+        || query.base().take_offsets.is_some()
+        || query.base().row_addr_prefilter.is_some()
+    {
         return true;
     }
     matches!(
@@ -157,6 +161,11 @@ pub async fn create_plan(
     if let AnyQuery::Query(request) = &query
         && let Some(offsets) = &request.take_offsets
     {
+        if request.row_addr_prefilter.is_some() {
+            return Err(Error::NotSupported {
+                message: "a row-address prefilter is not supported with take_offsets".to_string(),
+            });
+        }
         return crate::query::create_take_offsets_plan(table, request, offsets, options, false)
             .await;
     }
@@ -188,6 +197,14 @@ pub async fn create_plan(
         None => has_spec,
     };
     if use_lsm {
+        if query.base.row_addr_prefilter.is_some() {
+            return Err(Error::NotSupported {
+                message: "a row-address prefilter is not supported when MemWAL/LSM routing \
+                    is in effect: the LSM scanner does not apply it, so the mask would be \
+                    silently dropped. Set use_lsm(false) to read the base table only"
+                    .to_string(),
+            });
+        }
         return lsm::create_lsm_plan(table, ds_ref, query).await;
     }
 
@@ -271,6 +288,10 @@ pub async fn create_plan(
     }
 
     let mut scanner: Scanner = ds_ref.scan();
+    if let Some(prefilter) = &query.base.row_addr_prefilter {
+        let mask = (prefilter.0)(ds_ref.clone()).await?;
+        scanner.with_row_addr_prefilter(Arc::unwrap_or_clone(mask));
+    }
 
     if let Some(query_vector) = query_vector {
         let column = if let Some(col) = column {
@@ -559,6 +580,11 @@ async fn execute_namespace_query(
 /// Convert an AnyQuery to the namespace QueryTableRequest format.
 fn convert_to_namespace_query(query: &AnyQuery) -> Result<NsQueryTableRequest> {
     query.base().check_filter()?;
+    if query.base().row_addr_prefilter.is_some() {
+        return Err(Error::NotSupported {
+            message: "a row-address prefilter is not supported with namespace pushdown".to_string(),
+        });
+    }
     match query {
         AnyQuery::VectorQuery(vq) => {
             // Extract the query vector(s)

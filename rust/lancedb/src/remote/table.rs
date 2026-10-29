@@ -1013,6 +1013,11 @@ impl<S: HttpSend> RemoteTable<S> {
         params: &QueryRequest,
     ) -> Result<()> {
         params.check_filter()?;
+        if params.row_addr_prefilter.is_some() {
+            return Err(Error::NotSupported {
+                message: "a row-address prefilter is not supported on remote tables".to_string(),
+            });
+        }
         body["prefilter"] = params.prefilter.into();
         // Only forward use_lsm when explicitly set; a server that predates it
         // ignores the field and routes as it would by default.

@@ -78,6 +78,11 @@ where
     F: Fn(Option<PkFusion>) -> Fut,
     Fut: Future<Output = Result<T>>,
 {
+    if query.request.base.row_addr_prefilter.is_some() {
+        return Err(Error::NotSupported {
+            message: "a row-address prefilter is not supported with hybrid search".to_string(),
+        });
+    }
     // A previous query on this table was already refused, so skip straight to
     // the key.
     if query.request.base.use_lsm != Some(false) && query.parent.hybrid_pk_fusion_learned() {

@@ -29,6 +29,7 @@ use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt, stream, try_join
 use half::f16;
 /// Re-export Lance ColumnOrdering type for use in query ordering
 pub use lance::dataset::scanner::ColumnOrdering;
+use lance::dataset::scanner::RowAddrMask;
 use lance::dataset::{ROW_ID, scanner::DatasetRecordBatchStream};
 use lance_arrow::RecordBatchExt;
 use lance_datafusion::exec::{execute_plan, format_plan as format_analyzed_plan};
@@ -389,6 +390,43 @@ impl IntoQueryVector for Vec<f64> {
     }
 }
 
+/// The boxed future a [`RowAddrPrefilter`] hook returns.
+pub type RowAddrPrefilterFuture =
+    futures::future::BoxFuture<'static, lance::Result<Arc<RowAddrMask>>>;
+
+/// A hook that builds a row-address visibility mask for a query.
+///
+/// It is called inside `create_plan` with the exact dataset the plan is about to
+/// scan, and the mask is applied with lance's `Scanner::with_row_addr_prefilter`.
+/// The mask is a VISIBILITY filter, so every route that would bypass that scanner
+/// (LSM routing, take-offsets, namespace pushdown, hybrid fusion, remote tables)
+/// refuses a query carrying one rather than silently dropping it.
+#[derive(Clone)]
+pub struct RowAddrPrefilter(
+    pub(crate) Arc<dyn Fn(Arc<lance::dataset::Dataset>) -> RowAddrPrefilterFuture + Send + Sync>,
+);
+
+impl RowAddrPrefilter {
+    /// Wrap a closure that builds the mask for the dataset it is handed.
+    pub fn new<F>(f: F) -> Self
+    where
+        F: Fn(
+                Arc<lance::dataset::Dataset>,
+            ) -> futures::future::BoxFuture<'static, lance::Result<Arc<RowAddrMask>>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        Self(Arc::new(f))
+    }
+}
+
+impl std::fmt::Debug for RowAddrPrefilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RowAddrPrefilter")
+    }
+}
+
 /// Common parameters that can be applied to scans and vector queries
 pub trait QueryBase {
     /// Set the maximum number of results to return.
@@ -563,6 +601,14 @@ pub trait QueryBase {
     /// `use_lsm(false)` is set, because a base-only read would silently
     /// exclude un-compacted MemWAL data.
     fn use_lsm(self, enable: bool) -> Self;
+
+    /// Restrict the scan to the row addresses a hook admits.
+    ///
+    /// The hook runs inside plan creation with the dataset the plan scans. A
+    /// query carrying one is refused (`NotSupported`) on every route that does
+    /// not run lance's scanner: LSM routing, take-offsets, hybrid search and
+    /// remote tables.
+    fn row_addr_prefilter(self, p: RowAddrPrefilter) -> Self;
 }
 
 pub trait HasQuery {
@@ -636,6 +682,11 @@ impl<T: HasQuery> QueryBase for T {
 
     fn use_lsm(mut self, enable: bool) -> Self {
         self.mut_query().use_lsm = Some(enable);
+        self
+    }
+
+    fn row_addr_prefilter(mut self, p: RowAddrPrefilter) -> Self {
+        self.mut_query().row_addr_prefilter = Some(p);
         self
     }
 }
@@ -911,6 +962,9 @@ pub struct QueryRequest {
     ///   write spec.
     /// - `Some(false)` reads only the base table, bypassing the MemWAL.
     pub use_lsm: Option<bool>,
+
+    /// Row-address visibility hook; see [`RowAddrPrefilter`].
+    pub row_addr_prefilter: Option<RowAddrPrefilter>,
 }
 
 impl Default for QueryRequest {
@@ -931,6 +985,7 @@ impl Default for QueryRequest {
             disable_scoring_autoprojection: false,
             order_by: None,
             use_lsm: None,
+            row_addr_prefilter: None,
         }
     }
 }
@@ -1426,6 +1481,11 @@ impl VectorQuery {
         pk_fusion: Option<wal_fusion::PkFusion>,
         options: QueryExecutionOptions,
     ) -> Result<SendableRecordBatchStream> {
+        if self.request.base.row_addr_prefilter.is_some() {
+            return Err(Error::NotSupported {
+                message: "a row-address prefilter is not supported with hybrid search".to_string(),
+            });
+        }
         let max_batch_length = options.max_batch_length as usize;
         let internal_options = options.without_output_batch_length_limit();
         // clone query and specify we want to include row IDs, which can be needed for reranking
@@ -2012,6 +2072,13 @@ impl TakeQuery {
         parent: &dyn BaseTable,
         request: &QueryRequest,
     ) -> Result<(QueryRequest, String, bool, usize, Option<usize>)> {
+        // The lookup re-plans without `take_offsets`, so a mask would silently
+        // filter the take rather than be refused there.
+        if request.row_addr_prefilter.is_some() {
+            return Err(Error::NotSupported {
+                message: "a row-address prefilter is not supported with take_offsets".to_string(),
+            });
+        }
         let (mut request, ordering_column, drop_ordering_column) =
             Self::request_with_row_offset(parent, request).await?;
         // The lookup operates on distinct physical rows. Pagination is a logical
@@ -3816,5 +3883,258 @@ mod tests {
         ids.sort();
 
         assert_eq!(ids, vec![1, 5, 17]);
+    }
+
+    // ---- RowAddrPrefilter (knowdb #979 phase 2) ----
+
+    fn prefilter_batch() -> RecordBatch {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, false),
+            ArrowField::new("text", DataType::Utf8, false),
+            ArrowField::new(
+                "vector",
+                DataType::FixedSizeList(
+                    Arc::new(ArrowField::new("item", DataType::Float32, true)),
+                    2,
+                ),
+                true,
+            ),
+        ]));
+        let ids: Int32Array = (0..100).collect();
+        let text: StringArray = (0..100).map(|_| Some("alpha beta")).collect();
+        let vectors = FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+            (0..100).map(|i| Some(vec![Some(i as f32), Some(0.0)])),
+            2,
+        );
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(ids), Arc::new(text), Arc::new(vectors)],
+        )
+        .unwrap()
+    }
+
+    async fn prefilter_table(dir: &std::path::Path) -> Table {
+        let conn = connect(dir.to_str().unwrap()).execute().await.unwrap();
+        let batch = prefilter_batch();
+        let schema = batch.schema();
+        let reader: Box<dyn arrow_array::RecordBatchReader + Send> =
+            Box::new(RecordBatchIterator::new(vec![Ok(batch)], schema));
+        let table = conn.create_table("t", reader).execute().await.unwrap();
+        table
+            .create_index(&["text"], Index::FTS(Default::default()))
+            .execute()
+            .await
+            .unwrap();
+        table
+    }
+
+    fn allow(rows: &'static [u64]) -> RowAddrPrefilter {
+        RowAddrPrefilter::new(move |_ds| {
+            async move {
+                Ok(Arc::new(RowAddrMask::from_allowed(
+                    lance::dataset::scanner::RowAddrTreeMap::from_iter(rows.iter().copied()),
+                )))
+            }
+            .boxed()
+        })
+    }
+
+    fn ids_of(batches: &[RecordBatch]) -> Vec<i32> {
+        let mut ids: Vec<i32> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column_by_name("id")
+                    .unwrap()
+                    .as_primitive::<Int32Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    async fn install_wal_spec(table: &Table) {
+        table.set_unenforced_primary_key(["id"]).await.unwrap();
+        table
+            .set_lsm_write_spec(crate::table::LsmWriteSpec::unsharded())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_plain_query_with_a_row_addr_prefilter_returns_only_masked_rows() {
+        let tmp = tempdir().unwrap();
+        let table = prefilter_table(tmp.path()).await;
+        let out = table
+            .query()
+            .row_addr_prefilter(allow(&[3, 7, 42]))
+            .execute()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(ids_of(&out), vec![3, 7, 42]);
+    }
+
+    #[tokio::test]
+    async fn a_flat_vector_query_with_a_row_addr_prefilter_ranks_only_masked_rows() {
+        let tmp = tempdir().unwrap();
+        let table = prefilter_table(tmp.path()).await;
+        let out = table
+            .query()
+            .nearest_to(&[0.0, 0.0])
+            .unwrap()
+            .bypass_vector_index()
+            .limit(10)
+            .row_addr_prefilter(allow(&[3, 7, 42]))
+            .execute()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(ids_of(&out), vec![3, 7, 42]);
+    }
+
+    #[tokio::test]
+    async fn an_fts_query_with_a_row_addr_prefilter_ranks_only_masked_rows() {
+        let tmp = tempdir().unwrap();
+        let table = prefilter_table(tmp.path()).await;
+        let out = table
+            .query()
+            .full_text_search(FullTextSearchQuery::new("alpha".to_string()))
+            .limit(10)
+            .row_addr_prefilter(allow(&[3, 7, 42]))
+            .execute()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(ids_of(&out), vec![3, 7, 42]);
+    }
+
+    #[tokio::test]
+    async fn the_prefilter_is_called_with_the_dataset_the_plan_scans() {
+        let tmp = tempdir().unwrap();
+        let table = prefilter_table(tmp.path()).await;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+        let rec = seen.clone();
+        let hook = RowAddrPrefilter::new(move |ds| {
+            rec.lock().unwrap().push(ds.version().version);
+            async move {
+                Ok(Arc::new(RowAddrMask::from_allowed(
+                    lance::dataset::scanner::RowAddrTreeMap::from_iter([1u64]),
+                )))
+            }
+            .boxed()
+        });
+        table
+            .query()
+            .row_addr_prefilter(hook)
+            .execute()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let version = table.version().await.unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec![version]);
+    }
+
+    #[tokio::test]
+    async fn a_prefilter_is_refused_when_lsm_routing_resolves_on() {
+        let tmp = tempdir().unwrap();
+        let table = prefilter_table(tmp.path()).await;
+        install_wal_spec(&table).await;
+        // use_lsm unset on a table with a write spec resolves to LSM routing.
+        let err = table
+            .query()
+            .row_addr_prefilter(allow(&[1]))
+            .execute()
+            .await
+            .err()
+            .expect("unset use_lsm on a MemWAL table must refuse");
+        assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+        // Explicit use_lsm(true).
+        let err = table
+            .query()
+            .use_lsm(true)
+            .row_addr_prefilter(allow(&[1]))
+            .execute()
+            .await
+            .err()
+            .expect("use_lsm(true) must refuse");
+        assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+        // use_lsm(false) reads base only and is allowed.
+        let out = table
+            .query()
+            .use_lsm(false)
+            .row_addr_prefilter(allow(&[1]))
+            .execute()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(ids_of(&out), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn a_prefilter_is_refused_with_take_offsets() {
+        let tmp = tempdir().unwrap();
+        let table = prefilter_table(tmp.path()).await;
+        let mut q = table.take_offsets(vec![1, 2]);
+        q.request.row_addr_prefilter = Some(allow(&[1]));
+        let err = q
+            .execute()
+            .await
+            .err()
+            .expect("take_offsets + prefilter must refuse");
+        assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_prefilter_forces_local_namespace_execution() {
+        let tmp = tempdir().unwrap();
+        let table = prefilter_table(tmp.path()).await;
+        let q = table.query().row_addr_prefilter(allow(&[1]));
+        let any = AnyQuery::Query(q.current_request().clone());
+        assert!(crate::table::query::requires_local_namespace_execution(
+            &any
+        ));
+        let plain = AnyQuery::Query(table.query().current_request().clone());
+        assert!(!crate::table::query::requires_local_namespace_execution(
+            &plain
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_hybrid_query_with_a_row_addr_prefilter_is_refused() {
+        let tmp = tempdir().unwrap();
+        let table = prefilter_table(tmp.path()).await;
+        let err = table
+            .query()
+            .full_text_search(FullTextSearchQuery::new("alpha".to_string()))
+            .nearest_to(&[0.0, 0.0])
+            .unwrap()
+            .row_addr_prefilter(allow(&[1]))
+            .execute()
+            .await
+            .err()
+            .expect("hybrid + prefilter must refuse");
+        assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_failing_prefilter_fails_the_query() {
+        let tmp = tempdir().unwrap();
+        let table = prefilter_table(tmp.path()).await;
+        let hook =
+            RowAddrPrefilter::new(|_ds| async { Err(lance::Error::invalid_input("boom")) }.boxed());
+        let res = table.query().row_addr_prefilter(hook).execute().await;
+        assert!(res.is_err());
     }
 }
