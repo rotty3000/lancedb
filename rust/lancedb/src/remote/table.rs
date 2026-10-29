@@ -4035,6 +4035,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_row_addr_prefilter_is_refused_on_a_remote_table() {
+        use crate::query::{ExecutableQuery, QueryBase, RowAddrPrefilter};
+        use futures::FutureExt;
+        let table = Table::new_with_handler("my_table", |_| -> http::Response<String> {
+            panic!("a refused query must not reach the server")
+        });
+        let hook =
+            RowAddrPrefilter::new(|_| async { Err(lance::Error::invalid_input("unused")) }.boxed());
+        let err = table
+            .query()
+            .row_addr_prefilter(hook)
+            .execute()
+            .await
+            .err()
+            .expect("a remote table must refuse a row-address prefilter");
+        assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+        assert!(
+            err.to_string()
+                .contains("row-address prefilter is not supported on remote tables"),
+            "wrong reason: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_not_found() {
         let table = Table::new_with_handler("my_table", |_| {
             http::Response::builder()

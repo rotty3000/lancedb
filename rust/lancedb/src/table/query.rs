@@ -580,6 +580,8 @@ async fn execute_namespace_query(
 /// Convert an AnyQuery to the namespace QueryTableRequest format.
 fn convert_to_namespace_query(query: &AnyQuery) -> Result<NsQueryTableRequest> {
     query.base().check_filter()?;
+    // Defence in depth behind `requires_local_namespace_execution`, which keeps
+    // such queries off this path.
     if query.base().row_addr_prefilter.is_some() {
         return Err(Error::NotSupported {
             message: "a row-address prefilter is not supported with namespace pushdown".to_string(),
@@ -872,6 +874,25 @@ mod tests {
     use super::*;
     use crate::query::{ExecutableQuery, QueryBase, QueryExecutionOptions, QueryRequest};
     use crate::table::BaseTable;
+
+    #[test]
+    fn namespace_conversion_refuses_a_row_addr_prefilter() {
+        use futures::FutureExt;
+        let hook = crate::query::RowAddrPrefilter::new(|_| {
+            async { Err(lance::Error::invalid_input("unused")) }.boxed()
+        });
+        let query = AnyQuery::Query(QueryRequest {
+            row_addr_prefilter: Some(hook),
+            ..Default::default()
+        });
+        let err = convert_to_namespace_query(&query).expect_err("must refuse");
+        assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+        assert!(
+            err.to_string().contains("row-address prefilter")
+                && err.to_string().contains("namespace pushdown"),
+            "wrong reason: {err}"
+        );
+    }
 
     fn fixed_size_list_array(values: Vec<f32>, dimension: i32) -> FixedSizeListArray {
         FixedSizeListArray::try_new_from_values(Float32Array::from(values), dimension).unwrap()

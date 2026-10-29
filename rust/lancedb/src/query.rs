@@ -410,12 +410,7 @@ impl RowAddrPrefilter {
     /// Wrap a closure that builds the mask for the dataset it is handed.
     pub fn new<F>(f: F) -> Self
     where
-        F: Fn(
-                Arc<lance::dataset::Dataset>,
-            ) -> futures::future::BoxFuture<'static, lance::Result<Arc<RowAddrMask>>>
-            + Send
-            + Sync
-            + 'static,
+        F: Fn(Arc<lance::dataset::Dataset>) -> RowAddrPrefilterFuture + Send + Sync + 'static,
     {
         Self(Arc::new(f))
     }
@@ -608,6 +603,10 @@ pub trait QueryBase {
     /// query carrying one is refused (`NotSupported`) on every route that does
     /// not run lance's scanner: LSM routing, take-offsets, hybrid search and
     /// remote tables.
+    ///
+    /// The hook runs once per plan: once per sub-plan of a multi-vector query, and
+    /// again on `explain_plan` / `analyze_plan`. A caller with an expensive hook
+    /// should memoize its result.
     fn row_addr_prefilter(self, p: RowAddrPrefilter) -> Self;
 }
 
@@ -1481,9 +1480,11 @@ impl VectorQuery {
         pk_fusion: Option<wal_fusion::PkFusion>,
         options: QueryExecutionOptions,
     ) -> Result<SendableRecordBatchStream> {
+        // Defence in depth: `with_pk_fallback` refuses first on this path.
         if self.request.base.row_addr_prefilter.is_some() {
             return Err(Error::NotSupported {
-                message: "a row-address prefilter is not supported with hybrid search".to_string(),
+                message: "a row-address prefilter is not supported with hybrid search (run_hybrid)"
+                    .to_string(),
             });
         }
         let max_batch_length = options.max_batch_length as usize;
@@ -2076,7 +2077,8 @@ impl TakeQuery {
         // filter the take rather than be refused there.
         if request.row_addr_prefilter.is_some() {
             return Err(Error::NotSupported {
-                message: "a row-address prefilter is not supported with take_offsets".to_string(),
+                message: "a row-address prefilter is not supported with take_offsets lookup"
+                    .to_string(),
             });
         }
         let (mut request, ordering_column, drop_ordering_column) =
@@ -4058,6 +4060,11 @@ mod tests {
             .err()
             .expect("unset use_lsm on a MemWAL table must refuse");
         assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+        assert!(
+            err.to_string().contains("row-address prefilter")
+                && err.to_string().contains("MemWAL/LSM"),
+            "wrong reason: {err}"
+        );
         // Explicit use_lsm(true).
         let err = table
             .query()
@@ -4068,6 +4075,11 @@ mod tests {
             .err()
             .expect("use_lsm(true) must refuse");
         assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+        assert!(
+            err.to_string().contains("row-address prefilter")
+                && err.to_string().contains("MemWAL/LSM"),
+            "wrong reason: {err}"
+        );
         // use_lsm(false) reads base only and is allowed.
         let out = table
             .query()
@@ -4094,6 +4106,35 @@ mod tests {
             .err()
             .expect("take_offsets + prefilter must refuse");
         assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+        assert!(
+            err.to_string().contains("row-address prefilter")
+                && err.to_string().contains("take_offsets lookup"),
+            "wrong reason: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_prefilter_is_refused_by_create_plan_when_take_offsets_is_set() {
+        let tmp = tempdir().unwrap();
+        let table = prefilter_table(tmp.path()).await;
+        let request = QueryRequest {
+            take_offsets: Some(vec![1]),
+            row_addr_prefilter: Some(allow(&[1])),
+            ..Default::default()
+        };
+        let err = table
+            .base_table()
+            .create_plan(&AnyQuery::Query(request), Default::default())
+            .await
+            .expect_err("take_offsets + prefilter must refuse in create_plan");
+        assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("row-address prefilter")
+                && msg.contains("take_offsets")
+                && !msg.contains("lookup"),
+            "wrong reason: {err}"
+        );
     }
 
     #[tokio::test]
@@ -4126,6 +4167,12 @@ mod tests {
             .err()
             .expect("hybrid + prefilter must refuse");
         assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+        // Pins the OUTER guard (`with_pk_fallback`); `run_hybrid`'s own says "(run_hybrid)".
+        assert!(
+            err.to_string()
+                .ends_with("a row-address prefilter is not supported with hybrid search"),
+            "wrong reason: {err}"
+        );
     }
 
     #[tokio::test]
@@ -4134,7 +4181,13 @@ mod tests {
         let table = prefilter_table(tmp.path()).await;
         let hook =
             RowAddrPrefilter::new(|_ds| async { Err(lance::Error::invalid_input("boom")) }.boxed());
-        let res = table.query().row_addr_prefilter(hook).execute().await;
-        assert!(res.is_err());
+        let err = table
+            .query()
+            .row_addr_prefilter(hook)
+            .execute()
+            .await
+            .err()
+            .expect("a failing hook must fail the query");
+        assert!(err.to_string().contains("boom"), "wrong reason: {err}");
     }
 }
