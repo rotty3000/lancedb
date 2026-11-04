@@ -110,10 +110,12 @@ pub(crate) fn requires_local_namespace_execution(query: &AnyQuery) -> bool {
     // pushing these down would silently ignore the user's setting. For use_lsm that
     // is worse than a tuning miss: MemWAL read routing lives only in `create_plan`,
     // so a pushed-down query would return stale base-only data with no error.
-    // A row-address prefilter is applied only by the local scanner in `create_plan`.
+    // A row-address prefilter and a fragment restriction are applied only by the
+    // local scanner in `create_plan`.
     if query.base().use_lsm.is_some()
         || query.base().take_offsets.is_some()
         || query.base().row_addr_prefilter.is_some()
+        || query.base().fragments.is_some()
     {
         return true;
     }
@@ -166,6 +168,11 @@ pub async fn create_plan(
                 message: "a row-address prefilter is not supported with take_offsets".to_string(),
             });
         }
+        if request.fragments.is_some() {
+            return Err(Error::NotSupported {
+                message: "a fragment restriction is not supported with take_offsets".to_string(),
+            });
+        }
         return crate::query::create_take_offsets_plan(table, request, offsets, options, false)
             .await;
     }
@@ -202,6 +209,14 @@ pub async fn create_plan(
                 message: "a row-address prefilter is not supported when MemWAL/LSM routing \
                     is in effect: the LSM scanner does not apply it, so the mask would be \
                     silently dropped. Set use_lsm(false) to read the base table only"
+                    .to_string(),
+            });
+        }
+        if query.base.fragments.is_some() {
+            return Err(Error::NotSupported {
+                message: "a fragment restriction is not supported when MemWAL/LSM routing \
+                    is in effect: the LSM scanner does not apply it. Set use_lsm(false) to \
+                    read the base table only"
                     .to_string(),
             });
         }
@@ -287,6 +302,15 @@ pub async fn create_plan(
         }
     }
 
+    // lance applies a fragment restriction to a vector search only through the
+    // prefilter (`Scanner::nearest` refuses a fragment scan otherwise); it is
+    // set after `nearest` below, so that check is made here.
+    if query.base.fragments.is_some() && query_vector.is_some() && !query.base.prefilter {
+        return Err(Error::NotSupported {
+            message: "a fragment restriction on a vector query requires prefilter(true)"
+                .to_string(),
+        });
+    }
     let mut scanner: Scanner = ds_ref.scan();
     if let Some(prefilter) = &query.base.row_addr_prefilter {
         let mask = (prefilter.0)(ds_ref.clone()).await?;
@@ -339,6 +363,9 @@ pub async fn create_plan(
     scanner.distance_range(query.lower_bound, query.upper_bound);
     scanner.use_index(query.use_index);
     scanner.prefilter(query.base.prefilter);
+    if let Some(fragments) = &query.base.fragments {
+        scanner.with_fragments(fragments.clone());
+    }
 
     match query.base.select {
         Select::Columns(ref columns) => {
@@ -585,6 +612,11 @@ fn convert_to_namespace_query(query: &AnyQuery) -> Result<NsQueryTableRequest> {
     if query.base().row_addr_prefilter.is_some() {
         return Err(Error::NotSupported {
             message: "a row-address prefilter is not supported with namespace pushdown".to_string(),
+        });
+    }
+    if query.base().fragments.is_some() {
+        return Err(Error::NotSupported {
+            message: "a fragment restriction is not supported with namespace pushdown".to_string(),
         });
     }
     match query {
@@ -889,6 +921,21 @@ mod tests {
         assert!(matches!(err, Error::NotSupported { .. }), "{err}");
         assert!(
             err.to_string().contains("row-address prefilter")
+                && err.to_string().contains("namespace pushdown"),
+            "wrong reason: {err}"
+        );
+    }
+
+    #[test]
+    fn namespace_conversion_refuses_fragments() {
+        let query = AnyQuery::Query(QueryRequest {
+            fragments: Some(Vec::new()),
+            ..Default::default()
+        });
+        let err = convert_to_namespace_query(&query).expect_err("must refuse");
+        assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+        assert!(
+            err.to_string().contains("fragment restriction")
                 && err.to_string().contains("namespace pushdown"),
             "wrong reason: {err}"
         );

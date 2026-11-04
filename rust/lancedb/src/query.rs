@@ -964,6 +964,9 @@ pub struct QueryRequest {
 
     /// Row-address visibility hook; see [`RowAddrPrefilter`].
     pub row_addr_prefilter: Option<RowAddrPrefilter>,
+
+    /// Restrict the scan to these fragments; see [`VectorQuery::with_fragments`].
+    pub fragments: Option<Vec<lance::table::format::Fragment>>,
 }
 
 impl Default for QueryRequest {
@@ -985,6 +988,7 @@ impl Default for QueryRequest {
             order_by: None,
             use_lsm: None,
             row_addr_prefilter: None,
+            fragments: None,
         }
     }
 }
@@ -1463,6 +1467,25 @@ impl VectorQuery {
         self
     }
 
+    /// Restrict the search to `fragments` (lance's `Scanner::with_fragments`).
+    ///
+    /// Rows of every other fragment are neither scored nor read: the flat
+    /// path scans only these fragments, and the ANN path keeps only the index
+    /// segments that cover one of them, searches only their rows (the
+    /// restriction becomes the prefilter) and flat-scans those it leaves
+    /// uncovered. The fragments must belong to the version the query scans
+    /// (a `query_snapshot`'s, for a pinned read).
+    ///
+    /// Requires prefiltering (the default): lance applies a fragment
+    /// restriction to a vector search only through the prefilter. Like a
+    /// [`RowAddrPrefilter`], it is refused (`NotSupported`) on every route
+    /// that does not run lance's scanner: LSM routing, take-offsets,
+    /// namespace pushdown, hybrid search and remote tables.
+    pub fn with_fragments(mut self, fragments: Vec<lance::table::format::Fragment>) -> Self {
+        self.request.base.fragments = Some(fragments);
+        self
+    }
+
     pub async fn execute_hybrid(
         &self,
         options: QueryExecutionOptions,
@@ -1484,6 +1507,12 @@ impl VectorQuery {
         if self.request.base.row_addr_prefilter.is_some() {
             return Err(Error::NotSupported {
                 message: "a row-address prefilter is not supported with hybrid search (run_hybrid)"
+                    .to_string(),
+            });
+        }
+        if self.request.base.fragments.is_some() {
+            return Err(Error::NotSupported {
+                message: "a fragment restriction is not supported with hybrid search (run_hybrid)"
                     .to_string(),
             });
         }
@@ -2078,6 +2107,12 @@ impl TakeQuery {
         if request.row_addr_prefilter.is_some() {
             return Err(Error::NotSupported {
                 message: "a row-address prefilter is not supported with take_offsets lookup"
+                    .to_string(),
+            });
+        }
+        if request.fragments.is_some() {
+            return Err(Error::NotSupported {
+                message: "a fragment restriction is not supported with take_offsets lookup"
                     .to_string(),
             });
         }
@@ -4189,5 +4224,240 @@ mod tests {
             .err()
             .expect("a failing hook must fail the query");
         assert!(err.to_string().contains("boom"), "wrong reason: {err}");
+    }
+
+    // ---- VectorQuery::with_fragments (knowdb #1039) ----
+
+    /// `prefilter_table` (ids 0..100, fragment 0) plus a second fragment of ids
+    /// 100..200 whose vectors are as near the query as the first's.
+    async fn two_fragment_table(dir: &std::path::Path) -> Table {
+        let table = prefilter_table(dir).await;
+        let batch = prefilter_batch();
+        let ids: Int32Array = (100..200).collect();
+        let batch = RecordBatch::try_new(
+            batch.schema(),
+            vec![
+                Arc::new(ids),
+                batch.column(1).clone(),
+                batch.column(2).clone(),
+            ],
+        )
+        .unwrap();
+        table.add(batch).execute().await.unwrap();
+        table
+    }
+
+    async fn fragment(table: &Table, id: u64) -> lance::table::format::Fragment {
+        let ds = table.dataset().unwrap().get().await.unwrap();
+        ds.fragments()
+            .iter()
+            .find(|f| f.id == id)
+            .cloned()
+            .expect("fragment")
+    }
+
+    #[tokio::test]
+    async fn a_flat_vector_query_with_fragments_ranks_only_their_rows() {
+        let tmp = tempdir().unwrap();
+        let table = two_fragment_table(tmp.path()).await;
+        let second = fragment(&table, 1).await;
+        let base = table
+            .query()
+            .nearest_to(&[0.0, 0.0])
+            .unwrap()
+            .bypass_vector_index()
+            .limit(3);
+        let out = base
+            .clone()
+            .with_fragments(vec![second])
+            .execute()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(ids_of(&out), vec![100, 101, 102]);
+        // Unrestricted, the two fragments tie and fragment 0 is in the top 3.
+        let all = base
+            .execute()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert!(
+            ids_of(&all).iter().any(|id| *id < 100),
+            "{:?}",
+            ids_of(&all)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_indexed_vector_query_with_fragments_ranks_only_their_rows() {
+        let tmp = tempdir().unwrap();
+        let table = two_fragment_table(tmp.path()).await;
+        table
+            .create_index(
+                &["vector"],
+                Index::IvfFlat(
+                    crate::index::vector::IvfFlatIndexBuilder::default().num_partitions(2),
+                ),
+            )
+            .execute()
+            .await
+            .unwrap();
+        let second = fragment(&table, 1).await;
+        let out = table
+            .query()
+            .nearest_to(&[0.0, 0.0])
+            .unwrap()
+            .limit(3)
+            .with_fragments(vec![second])
+            .execute()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(ids_of(&out), vec![100, 101, 102]);
+    }
+
+    #[tokio::test]
+    async fn fragments_compose_with_a_row_addr_prefilter() {
+        let tmp = tempdir().unwrap();
+        let table = two_fragment_table(tmp.path()).await;
+        let second = fragment(&table, 1).await;
+        // Rows 0 and 1 of fragment 0, rows 5 and 6 of fragment 1.
+        let out = table
+            .query()
+            .nearest_to(&[0.0, 0.0])
+            .unwrap()
+            .bypass_vector_index()
+            .limit(10)
+            .row_addr_prefilter(allow(&[0, 1, (1 << 32) | 5, (1 << 32) | 6]))
+            .with_fragments(vec![second])
+            .execute()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(ids_of(&out), vec![105, 106]);
+    }
+
+    async fn refusal(q: VectorQuery) -> Error {
+        q.execute().await.err().expect("must refuse")
+    }
+
+    #[tokio::test]
+    async fn fragments_are_refused_when_lsm_routing_resolves_on() {
+        let tmp = tempdir().unwrap();
+        let table = two_fragment_table(tmp.path()).await;
+        install_wal_spec(&table).await;
+        let frag = fragment(&table, 1).await;
+        let q = table
+            .query()
+            .nearest_to(&[0.0, 0.0])
+            .unwrap()
+            .with_fragments(vec![frag.clone()]);
+        let err = refusal(q).await;
+        assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+        assert!(
+            err.to_string().contains("fragment restriction")
+                && err.to_string().contains("MemWAL/LSM"),
+            "wrong reason: {err}"
+        );
+        // use_lsm(false) reads base only and is allowed.
+        let out = table
+            .query()
+            .use_lsm(false)
+            .nearest_to(&[0.0, 0.0])
+            .unwrap()
+            .bypass_vector_index()
+            .limit(1)
+            .with_fragments(vec![frag])
+            .execute()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(ids_of(&out), vec![100]);
+    }
+
+    #[tokio::test]
+    async fn fragments_on_a_postfiltered_vector_query_are_refused() {
+        let tmp = tempdir().unwrap();
+        let table = two_fragment_table(tmp.path()).await;
+        let frag = fragment(&table, 1).await;
+        let q = table
+            .query()
+            .nearest_to(&[0.0, 0.0])
+            .unwrap()
+            .postfilter()
+            .with_fragments(vec![frag]);
+        let err = refusal(q).await;
+        assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+        assert!(
+            err.to_string().contains("requires prefilter"),
+            "wrong reason: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hybrid_query_with_fragments_is_refused() {
+        let tmp = tempdir().unwrap();
+        let table = two_fragment_table(tmp.path()).await;
+        let frag = fragment(&table, 1).await;
+        let q = table
+            .query()
+            .full_text_search(FullTextSearchQuery::new("alpha".to_string()))
+            .nearest_to(&[0.0, 0.0])
+            .unwrap()
+            .with_fragments(vec![frag]);
+        let err = refusal(q).await;
+        assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+        assert!(
+            err.to_string()
+                .ends_with("a fragment restriction is not supported with hybrid search"),
+            "wrong reason: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fragments_are_refused_by_create_plan_when_take_offsets_is_set() {
+        let tmp = tempdir().unwrap();
+        let table = two_fragment_table(tmp.path()).await;
+        let request = QueryRequest {
+            take_offsets: Some(vec![1]),
+            fragments: Some(vec![fragment(&table, 1).await]),
+            ..Default::default()
+        };
+        let err = table
+            .base_table()
+            .create_plan(&AnyQuery::Query(request), Default::default())
+            .await
+            .expect_err("take_offsets + fragments must refuse in create_plan");
+        assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+        assert!(
+            err.to_string().contains("fragment restriction")
+                && err.to_string().contains("take_offsets"),
+            "wrong reason: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fragments_force_local_namespace_execution() {
+        let tmp = tempdir().unwrap();
+        let table = two_fragment_table(tmp.path()).await;
+        let q = table
+            .query()
+            .nearest_to(&[0.0, 0.0])
+            .unwrap()
+            .with_fragments(vec![fragment(&table, 1).await]);
+        let any = AnyQuery::VectorQuery(q.request.clone());
+        assert!(crate::table::query::requires_local_namespace_execution(
+            &any
+        ));
     }
 }
