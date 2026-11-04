@@ -1051,6 +1051,11 @@ impl<S: HttpSend> RemoteTable<S> {
                 message: "a row-address prefilter is not supported on remote tables".to_string(),
             });
         }
+        if params.fragments.is_some() {
+            return Err(Error::NotSupported {
+                message: "a fragment restriction is not supported on remote tables".to_string(),
+            });
+        }
         body["prefilter"] = params.prefilter.into();
         // Only forward use_rte when explicitly set; a server that predates it
         // ignores the field and routes as it would by default.
@@ -4162,6 +4167,29 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("row-address prefilter is not supported on remote tables"),
+            "wrong reason: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fragments_are_refused_on_a_remote_table() {
+        use crate::query::ExecutableQuery;
+        let table = Table::new_with_handler("my_table", |_| -> http::Response<String> {
+            panic!("a refused query must not reach the server")
+        });
+        let err = table
+            .query()
+            .nearest_to(&[0.0, 0.0])
+            .unwrap()
+            .with_fragments(Vec::new())
+            .execute()
+            .await
+            .err()
+            .expect("a remote table must refuse a fragment restriction");
+        assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+        assert!(
+            err.to_string()
+                .contains("fragment restriction is not supported on remote tables"),
             "wrong reason: {err}"
         );
     }
